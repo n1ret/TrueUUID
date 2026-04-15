@@ -1,12 +1,13 @@
 package cn.alini.trueuuid.server;
 
-import net.minecraft.network.Connection;
-
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
+import net.minecraft.network.Connection;
+
 /**
- * 在登录阶段记录“放行离线”的连接；玩家完全进服后消费并提示。
+ * Records connections granted offline fallback during login;
+ * consumed after full join for post-login notification.
  */
 public final class AuthState {
     public enum FallbackReason { TIMEOUT, FAILURE }

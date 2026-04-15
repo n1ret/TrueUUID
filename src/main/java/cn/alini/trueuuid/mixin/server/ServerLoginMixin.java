@@ -1,12 +1,27 @@
 // java
 package cn.alini.trueuuid.mixin.server;
 
-import cn.alini.trueuuid.config.TrueuuidConfig;
-import cn.alini.trueuuid.net.NetIds;
-import cn.alini.trueuuid.server.*;
-import cn.alini.trueuuid.Trueuuid;
+import java.net.InetSocketAddress;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
 import com.mojang.authlib.GameProfile;
 import com.mojang.authlib.properties.Property;
+
+import cn.alini.trueuuid.Trueuuid;
+import cn.alini.trueuuid.config.TrueuuidConfig;
+import cn.alini.trueuuid.net.NetIds;
+import cn.alini.trueuuid.server.AuthDecider;
+import cn.alini.trueuuid.server.AuthState;
+import cn.alini.trueuuid.server.SessionCheck;
+import cn.alini.trueuuid.server.TrueuuidRuntime;
 import io.netty.buffer.Unpooled;
 import net.minecraft.network.Connection;
 import net.minecraft.network.FriendlyByteBuf;
@@ -17,41 +32,31 @@ import net.minecraft.network.protocol.login.ClientboundLoginDisconnectPacket;
 import net.minecraft.network.protocol.login.ServerboundCustomQueryPacket;
 import net.minecraft.network.protocol.login.ServerboundHelloPacket;
 import net.minecraft.server.MinecraftServer;
-import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Shadow;
-import org.spongepowered.asm.mixin.Unique;
-import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-
-import java.net.InetSocketAddress;
-import java.util.UUID;
-import java.util.concurrent.atomic.AtomicInteger;
 
 @Mixin(targets = "net.minecraft.server.network.ServerLoginPacketListenerImpl")
 public abstract class ServerLoginMixin {
     @Shadow private GameProfile gameProfile;
     @Shadow private MinecraftServer server;
-    @Shadow private Connection connection; // 1.20.1 是字段
+    @Shadow private Connection connection; // In 1.20.1 this is a field.
 
     @Shadow public abstract void disconnect(Component reason);
 
-    // 握手状态
-    // 避免与 Forge 登录协商使用的小 txId（0/1/2/...）冲突
+    // Handshake state.
+    // Avoid conflicts with Forge login negotiation txIds (0/1/2/...).
     @Unique private static final AtomicInteger TRUEUUID$NEXT_TX_ID = new AtomicInteger(0x4000);
     @Unique private int trueuuid$txId = 0;
     @Unique private String trueuuid$nonce = null;
     @Unique private long trueuuid$sentAt = 0L;
 
 
-    // 新增：防止重复处理客户端认证包（同次握手只处理一次）
+    // Prevent duplicate handling of client auth packets within the same handshake.
     @Unique private volatile boolean trueuuid$ackHandled = false;
 
     @Inject(method = "handleHello", at = @At("TAIL"))
     private void trueuuid$afterHello(ServerboundHelloPacket pkt, CallbackInfo ci) {
         if (this.server.usesAuthentication() || this.gameProfile == null) return;
 
-        // 若开启 nomojang，则直接使用本地策略，不向客户端发送会话认证包
+        // If nomojang is enabled, apply local policy and skip session auth packet.
         if (TrueuuidConfig.nomojangEnabled()) {
             String name = this.gameProfile.getName();
             String ip;
@@ -60,45 +65,45 @@ public abstract class ServerLoginMixin {
             } else {
                 ip = null;
             }
-            Trueuuid.debug("nomojang 模式：跳过 Mojang 会话认证, 玩家: {}, ip: {}", name != null ? name : "<unknown>", ip);
+            Trueuuid.debug("nomojang mode: skipping Mojang session authentication, player: {}, ip: {}", name != null ? name : "<unknown>", ip);
 
-            // 尝试同 IP 的近期容错命中 -> 视为正版
+            // Try recent same-IP grace hit -> treat as premium.
             if (TrueuuidConfig.recentIpGraceEnabled() && ip != null) {
                 var pOpt = TrueuuidRuntime.IP_GRACE.tryGrace(name, ip, TrueuuidConfig.recentIpGraceTtlSeconds());
                 if (pOpt.isPresent()) {
                     UUID premium = pOpt.get();
                     if (premium != null) {
-                        Trueuuid.debug("nomojang: 找到同IP正版记录，按正版处理, uuid={}", premium);
+                        Trueuuid.debug("nomojang: found same-IP premium record; handling as premium, uuid={}", premium);
                         GameProfile newProfile = new GameProfile(premium, name);
                         this.gameProfile = newProfile;
-                        // 记录成功（保持注册表/缓存一致）
+                        // Record success to keep registry/cache consistent.
                         TrueuuidRuntime.NAME_REGISTRY.recordSuccess(name, premium, ip);
                         TrueuuidRuntime.IP_GRACE.record(name, ip, premium);
-                        return; // 直接返回，按正版处理完毕
+                        return; // Done: handled as premium.
                     }
                 }
             }
 
-            // 其余情况：直接按离线处理（不阻止进入）
-            Trueuuid.debug("nomojang: 未命中同IP正版记录，按离线方式放行");
-            // 不发送自定义认证包，保持默认的离线行为
+            // Otherwise: allow offline handling (do not block join).
+            Trueuuid.debug("nomojang: no same-IP premium record hit, allowing offline path");
+            // Do not send custom auth packet; keep default offline behavior.
             return;
         }
 
 
-        // 清理 ack 处理标志（新握手重新可处理）
+        // Reset ack handling flag for the new handshake.
         this.trueuuid$ackHandled = false;
 
         this.trueuuid$nonce = UUID.randomUUID().toString().replace("-", "");
         this.trueuuid$txId = TRUEUUID$NEXT_TX_ID.getAndIncrement();
         this.trueuuid$sentAt = System.currentTimeMillis();
 
-        Trueuuid.debug("handleHello: 开始握手, 玩家: {}", this.gameProfile != null ? this.gameProfile.getName() : "<unknown>");
-        Trueuuid.debug("握手 nonce: {}, txId: {}", this.trueuuid$nonce, this.trueuuid$txId);
+        Trueuuid.debug("handleHello: starting handshake, player: {}", this.gameProfile != null ? this.gameProfile.getName() : "<unknown>");
+        Trueuuid.debug("handshake nonce: {}, txId: {}", this.trueuuid$nonce, this.trueuuid$txId);
 
         FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
         buf.writeUtf(this.trueuuid$nonce);
-        // 额外携带服务端超时配置，让客户端能提前在超时前回包，避免“晚到的 LOGIN 回包”撞上压缩阶段
+        // Include server timeout so client can reply early and avoid late LOGIN packet issues.
         buf.writeLong(TrueuuidConfig.timeoutMs());
 
         this.connection.send(new ClientboundCustomQueryPacket(this.trueuuid$txId, NetIds.AUTH, buf));
@@ -113,21 +118,21 @@ public abstract class ServerLoginMixin {
         long now = System.currentTimeMillis();
         if (now - this.trueuuid$sentAt < timeoutMs) return;
 
-        Trueuuid.debug("握手超时, txId: {}", this.trueuuid$txId);
+        Trueuuid.debug("handshake timed out, txId: {}", this.trueuuid$txId);
 
         if (TrueuuidConfig.allowOfflineOnTimeout()) {
-            Trueuuid.debug("超时允许离线进入");
+            Trueuuid.debug("timeout allows offline join");
             AuthState.markOfflineFallback(this.connection, AuthState.FallbackReason.TIMEOUT);
             reset();
         } else {
             String msg = TrueuuidConfig.timeoutKickMessage();
-            Component reason = Component.literal(msg != null ? msg : "登录超时，未完成账号校验");
+            Component reason = Component.literal(msg != null ? msg : "Login timed out; account verification not completed");
             sendDisconnectWithReason(reason);
             reset();
         }
     }
 
-    // 在 TrueUUID 握手完成前，不允许进入 handleAcceptedLogin（否则会导致协议阶段切换，客户端后续再回包会解码错包）
+    // Block handleAcceptedLogin until TrueUUID handshake is complete.
     @Inject(method = "handleAcceptedLogin", at = @At("HEAD"), cancellable = true)
     private void trueuuid$delayAcceptedLogin(CallbackInfo ci) {
         if (this.trueuuid$txId != 0) {
@@ -146,12 +151,12 @@ public abstract class ServerLoginMixin {
         } else {
             ip = null;
         }
-        Trueuuid.debug("收到客户端认证包, 玩家: {}, ip: {}, txId: {}", this.gameProfile != null ? this.gameProfile.getName() : "<unknown>", ip, this.trueuuid$txId);
+        Trueuuid.debug("received client auth packet, player: {}, ip: {}, txId: {}", this.gameProfile != null ? this.gameProfile.getName() : "<unknown>", ip, this.trueuuid$txId);
 
         FriendlyByteBuf data = packet.getData();
         if (data == null) {
-            Trueuuid.debug("认证失败, 玩家: {}, ip: {}, 原因: 缺少数据", this.gameProfile != null ? this.gameProfile.getName() : "<unknown>", ip);
-            handleAuthFailure(ip, "缺少数据");
+            Trueuuid.debug("auth failed, player: {}, ip: {}, reason: missing data", this.gameProfile != null ? this.gameProfile.getName() : "<unknown>", ip);
+            handleAuthFailure(ip, "missing data");
             reset(); ci.cancel(); return;
         }
 
@@ -159,26 +164,26 @@ public abstract class ServerLoginMixin {
         try {
             ackOk = data.readBoolean();
         } catch (Throwable t) {
-            Trueuuid.debug(t, "读取客户端认证包 ackOk 失败, player={}, ip={}, txId={}", this.gameProfile != null ? this.gameProfile.getName() : "<unknown>", ip, this.trueuuid$txId);
+            Trueuuid.debug(t, "failed reading ackOk from client auth packet, player={}, ip={}, txId={}", this.gameProfile != null ? this.gameProfile.getName() : "<unknown>", ip, this.trueuuid$txId);
         }
-        Trueuuid.debug("客户端认证包 ackOk: {}", ackOk);
+        Trueuuid.debug("client auth packet ackOk: {}", ackOk);
         if (!ackOk) {
-            Trueuuid.debug("认证失败, 玩家: {}, ip: {}, 原因: 客户端拒绝", this.gameProfile != null ? this.gameProfile.getName() : "<unknown>", ip);
-            handleAuthFailure(ip, "客户端拒绝");
+            Trueuuid.debug("auth failed, player: {}, ip: {}, reason: client rejected", this.gameProfile != null ? this.gameProfile.getName() : "<unknown>", ip);
+            handleAuthFailure(ip, "client rejected");
             reset(); ci.cancel(); return;
         }
 
-        // 幂等保护：如果已经处理过本次握手的 ack，则忽略重复包
+        // Idempotency guard: ignore duplicate ack packets for the same handshake.
         if (this.trueuuid$ackHandled) {
-            Trueuuid.debug("重复认证包忽略, txId: {}", this.trueuuid$txId);
+            Trueuuid.debug("duplicate auth packet ignored, txId: {}", this.trueuuid$txId);
             ci.cancel();
             return;
         }
         this.trueuuid$ackHandled = true;
 
-        // 关键：使用异步 API，不在主线程阻塞
+        // Key point: use async API and avoid blocking the main thread.
         try {
-            // 立即取消原始调用（以免继续执行原有逻辑），但不要 reset()，保留状态直到回调完成
+            // Cancel original handling immediately, but keep state until callback completes.
             ci.cancel();
 
             final int expectedTxId = this.trueuuid$txId;
@@ -187,29 +192,29 @@ public abstract class ServerLoginMixin {
 
             SessionCheck.hasJoinedAsync(expectedName, expectedNonce, ip)
                     .whenComplete((resOpt, throwable) -> {
-                        // 始终在主线程处理后续逻辑
+                        // Always continue on the main thread.
                         server.execute(() -> {
-                            // 若已超时/重置/进入下一阶段，则忽略过期回调，避免登录已接受后再改 profile 或触发断开
+                            // Ignore stale callbacks after timeout/reset/stage switch.
                             if (this.trueuuid$txId != expectedTxId || this.trueuuid$nonce == null || !this.trueuuid$nonce.equals(expectedNonce)) {
-                                Trueuuid.debug("忽略过期回调, expectedTxId={}, currentTxId={}, noncePresent={}", expectedTxId, this.trueuuid$txId, this.trueuuid$nonce != null);
+                                Trueuuid.debug("stale callback ignored, expectedTxId={}, currentTxId={}, noncePresent={}", expectedTxId, this.trueuuid$txId, this.trueuuid$nonce != null);
                                 return;
                             }
                             try {
                                 if (throwable != null) {
-                                    Trueuuid.debug(throwable, "认证异步回调发生异常, player={}, ip={}, txId={}", expectedName, ip, expectedTxId);
-                                    handleAuthFailure(ip, "服务器异常");
+                                    Trueuuid.debug(throwable, "auth async callback threw exception, player={}, ip={}, txId={}", expectedName, ip, expectedTxId);
+                                    handleAuthFailure(ip, "server exception");
                                     return;
                                 }
 
                                 if (resOpt.isEmpty()) {
-                                    Trueuuid.debug("认证失败, 玩家: {}, ip: {}, 原因: 会话无效", this.gameProfile != null ? this.gameProfile.getName() : "<unknown>", ip);
-                                    handleAuthFailure(ip, "会话无效");
+                                    Trueuuid.debug("auth failed, player: {}, ip: {}, reason: invalid session", this.gameProfile != null ? this.gameProfile.getName() : "<unknown>", ip);
+                                    handleAuthFailure(ip, "invalid session");
                                     return;
                                 }
 
                                 var res = resOpt.get();
 
-                                // 成功：记录注册表/近期 IP；替换为正版 UUID + 名称大小写矫正 + 注入皮肤
+                                // Success: record registry/recent IP and replace profile with premium UUID + corrected name + skin properties.
                                 TrueuuidRuntime.NAME_REGISTRY.recordSuccess(res.name(), res.uuid(), ip);
                                 TrueuuidRuntime.IP_GRACE.record(res.name(), ip, res.uuid());
 
@@ -225,8 +230,8 @@ public abstract class ServerLoginMixin {
                                 }
                                 this.gameProfile = newProfile;
                             } catch (Throwable t) {
-                                Trueuuid.debug(t, "认证异步处理时发生异常, player={}, ip={}, txId={}", expectedName, ip, expectedTxId);
-                                handleAuthFailure(ip, "服务器异常");
+                                Trueuuid.debug(t, "exception during async auth handling, player={}, ip={}, txId={}", expectedName, ip, expectedTxId);
+                                handleAuthFailure(ip, "server exception");
                             } finally {
                                 reset();
                             }
@@ -234,9 +239,9 @@ public abstract class ServerLoginMixin {
                     });
 
         } catch (Throwable t) {
-            // 若构造异步调用时报错（极少见），则回退为失败处理并重置
-            Trueuuid.debug(t, "启动异步认证时出错, player={}, ip={}, txId={}", this.gameProfile != null ? this.gameProfile.getName() : "<unknown>", ip, this.trueuuid$txId);
-            handleAuthFailure(ip, "服务器异常");
+            // If async setup fails (rare), fall back to failure handling and reset.
+            Trueuuid.debug(t, "error starting async authentication, player={}, ip={}, txId={}", this.gameProfile != null ? this.gameProfile.getName() : "<unknown>", ip, this.trueuuid$txId);
+            handleAuthFailure(ip, "server exception");
             reset();
             this.trueuuid$ackHandled = false;
         }
@@ -245,7 +250,7 @@ public abstract class ServerLoginMixin {
     @Unique
     private void handleAuthFailure(String ip, String why) {
         String name = this.gameProfile != null ? this.gameProfile.getName() : "<unknown>";
-        Trueuuid.debug("鉴权失败, 玩家: {}, ip: {}, 原因: {}", name, ip, why);
+        Trueuuid.debug("authentication failed, player: {}, ip: {}, reason: {}", name, ip, why);
         AuthDecider.Decision d = AuthDecider.onFailure(name, ip);
 
         switch (d.kind) {
@@ -259,13 +264,13 @@ public abstract class ServerLoginMixin {
                 }
             }
             case OFFLINE -> {
-                Trueuuid.debug("离线进入, 玩家: {}, ip: {}", name, ip);
+                Trueuuid.debug("offline join granted, player: {}, ip: {}", name, ip);
                 AuthState.markOfflineFallback(this.connection, AuthState.FallbackReason.FAILURE);
             }
             case DENY -> {
                 String msg = d.denyMessage != null ? d.denyMessage
-                        : "鉴权失败，已禁止离线进入以保护你的正版存档。请稍后重试。";
-                Trueuuid.debug("认证被拒绝, 玩家: {}, ip: {}, 消息: {}", name, ip, msg);
+                        : "Authentication failed. Offline login has been blocked to protect your premium player data. Please try again later.";
+                Trueuuid.debug("authentication denied, player: {}, ip: {}, message: {}", name, ip, msg);
                 sendDisconnectWithReason(Component.literal(msg));
             }
         }
@@ -273,13 +278,13 @@ public abstract class ServerLoginMixin {
 
     @Unique
     private void sendDisconnectWithReason(Component reason) {
-        // 异步断开，避免主线程卡死
+        // Disconnect asynchronously to avoid stalling the main thread.
         new Thread(() -> {
             try {
                 this.connection.send(new ClientboundLoginDisconnectPacket(reason));
                 this.connection.send(new ClientboundDisconnectPacket(reason));
             } catch (Throwable t) {
-                Trueuuid.debug(t, "发送断开连接原因包失败");
+                Trueuuid.debug(t, "failed to send disconnect reason packet");
             }
             this.connection.disconnect(reason);
         }, "TrueUUID-AsyncDisconnect").start();
@@ -287,7 +292,7 @@ public abstract class ServerLoginMixin {
 
     @Unique
     private void reset() {
-        Trueuuid.debug("状态重置, txId: {}", this.trueuuid$txId);
+        Trueuuid.debug("state reset, txId: {}", this.trueuuid$txId);
         this.trueuuid$txId = 0;
         this.trueuuid$nonce = null;
         this.trueuuid$sentAt = 0L;

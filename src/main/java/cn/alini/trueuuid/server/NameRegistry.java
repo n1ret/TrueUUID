@@ -1,15 +1,25 @@
 package cn.alini.trueuuid.server;
 
-import com.google.gson.*;
-import cn.alini.trueuuid.Trueuuid;
-import net.minecraftforge.fml.loading.FMLPaths;
-
 import java.io.Reader;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
-import java.util.*;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import cn.alini.trueuuid.Trueuuid;
+import net.minecraftforge.fml.loading.FMLPaths;
 
 public class NameRegistry {
     public static class Entry {
@@ -66,7 +76,7 @@ public class NameRegistry {
                 }
             }
         } catch (Exception ex) {
-            Trueuuid.warn(ex, "读取 trueuuid-registry.json 失败: {}", file);
+            Trueuuid.warn(ex, "Failed to read trueuuid-registry.json: {}", file);
         }
     }
 
@@ -91,7 +101,7 @@ public class NameRegistry {
                 gson.toJson(o, w);
             }
         } catch (Exception ex) {
-            Trueuuid.warn(ex, "写入 trueuuid-registry.json 失败: {}", file);
+            Trueuuid.warn(ex, "Failed to write trueuuid-registry.json: {}", file);
         }
     }
 }

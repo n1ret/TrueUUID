@@ -1,11 +1,6 @@
 // java
 package cn.alini.trueuuid.server;
 
-import cn.alini.trueuuid.config.TrueuuidConfig;
-import cn.alini.trueuuid.Trueuuid;
-import com.google.gson.Gson;
-import com.google.gson.annotations.SerializedName;
-
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
@@ -17,8 +12,14 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
+import com.google.gson.Gson;
+import com.google.gson.annotations.SerializedName;
+
+import cn.alini.trueuuid.Trueuuid;
+import cn.alini.trueuuid.config.TrueuuidConfig;
+
 /**
- * 服务端调用 hasJoined 校验正版并获取最终 UUID 与皮肤属性
+ * Server-side hasJoined validation for premium auth, final UUID, and skin properties.
  */
 public final class SessionCheck {
     private static final HttpClient HTTP = HttpClient.newHttpClient();
@@ -30,7 +31,7 @@ public final class SessionCheck {
     public record HasJoinedResult(UUID uuid, String name, List<Property> properties) {}
 
     private static class HasJoinedJson {
-        String id; // 无连字符的 UUID
+        String id; // UUID without hyphens
         String name;
         List<Prop> properties;
     }
@@ -42,30 +43,30 @@ public final class SessionCheck {
     }
 
     /**
-     * 异步版本：不阻塞调用线程，返回 CompletableFuture\<Optional\<HasJoinedResult\>\>
+        * Async version: non-blocking and returns CompletableFuture<Optional<HasJoinedResult>>.
      */
     public static CompletableFuture<Optional<HasJoinedResult>> hasJoinedAsync(String username, String serverId, String ip) {
         String url = TrueuuidConfig.COMMON.mojangReverseProxy.get()+"/session/minecraft/hasJoined"
                 + "?username=" + URLEncoder.encode(username, StandardCharsets.UTF_8)
                 + "&serverId=" + URLEncoder.encode(serverId, StandardCharsets.UTF_8);
 
-        Trueuuid.debug("请求 Mojang 校验接口: {}", url);
+        Trueuuid.debug("Requesting Mojang validation endpoint: {}", url);
 
         HttpRequest req = HttpRequest.newBuilder(URI.create(url)).GET().build();
 
         return HTTP.sendAsync(req, HttpResponse.BodyHandlers.ofString())
                 .thenApply(resp -> {
-                    Trueuuid.debug("Mojang 响应状态码: {}", resp.statusCode());
-                    Trueuuid.debug("Mojang 响应内容(len={}): {}", resp.body() != null ? resp.body().length() : -1, clamp(resp.body(), DEBUG_BODY_MAX_CHARS));
+                    Trueuuid.debug("Mojang response status code: {}", resp.statusCode());
+                    Trueuuid.debug("Mojang response body(len={}): {}", resp.body() != null ? resp.body().length() : -1, clamp(resp.body(), DEBUG_BODY_MAX_CHARS));
 
                     if (resp.statusCode() != 200) {
-                        Trueuuid.debug("校验失败：状态码非200，返回空");
+                        Trueuuid.debug("Validation failed: non-200 status code, returning empty");
                         return Optional.<HasJoinedResult>empty();
                     }
 
                     HasJoinedJson dto = GSON.fromJson(resp.body(), HasJoinedJson.class);
                     if (dto == null || dto.id == null) {
-                        Trueuuid.debug("解析JSON失败或未获取到UUID，返回空");
+                        Trueuuid.debug("JSON parse failed or UUID missing, returning empty");
                         return Optional.<HasJoinedResult>empty();
                     }
 
@@ -73,7 +74,7 @@ public final class SessionCheck {
                             "(\\p{XDigit}{8})(\\p{XDigit}{4})(\\p{XDigit}{4})(\\p{XDigit}{4})(\\p{XDigit}{12})",
                             "$1-$2-$3-$4-$5"));
 
-                    Trueuuid.debug("校验成功：UUID={}, 玩家名={}", uuid, dto.name);
+                    Trueuuid.debug("Validation succeeded: UUID={}, player={}", uuid, dto.name);
 
                     List<Property> props = dto.properties == null ? List.of() :
                             dto.properties.stream()
@@ -83,15 +84,15 @@ public final class SessionCheck {
                     return Optional.of(new HasJoinedResult(uuid, dto.name, props));
                 })
                 .exceptionally(ex -> {
-                    Trueuuid.debug(ex, "与 Mojang 通信或解析时发生异常");
+                    Trueuuid.debug(ex, "Exception while communicating with Mojang or parsing response");
                     return Optional.empty();
                 });
     }
 
-    // 保留同步方法（若需要）或移除
+    // Keep sync method for compatibility if needed, or remove it.
     public static Optional<HasJoinedResult> hasJoined(String username, String serverId, String ip) throws Exception {
-        // 保留原同步实现（或内部调用 hasJoinedAsync().get()，视需要）
-        throw new UnsupportedOperationException("同步 hasJoined 已不推荐使用，请使用 hasJoinedAsync");
+        // Keep original sync implementation (or call hasJoinedAsync().get()) if needed.
+        throw new UnsupportedOperationException("Synchronous hasJoined is no longer recommended; use hasJoinedAsync");
     }
 
     private static String clamp(String s, int maxChars) {

@@ -1,23 +1,24 @@
 package cn.alini.trueuuid.mixin.client;
 
-import cn.alini.trueuuid.net.NetIds;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.injection.At; // official mappings
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
 import cn.alini.trueuuid.Trueuuid;
+import cn.alini.trueuuid.net.NetIds;
 import io.netty.buffer.Unpooled;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.User; // official 映射
+import net.minecraft.client.User;
 import net.minecraft.client.multiplayer.ClientHandshakePacketListenerImpl;
 import net.minecraft.network.Connection;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.protocol.login.ClientboundCustomQueryPacket;
 import net.minecraft.network.protocol.login.ServerboundCustomQueryPacket;
-import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Shadow;
-import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 
 @Mixin(ClientHandshakePacketListenerImpl.class)
 public abstract class ClientHandshakeMixin {
@@ -36,7 +37,7 @@ public abstract class ClientHandshakeMixin {
                 serverTimeoutMs = buf.readLong();
             }
         } catch (Throwable t) {
-            Trueuuid.debug(t, "读取服务端超时字段失败, txId={}", txId);
+            Trueuuid.debug(t, "Failed to read server timeout field, txId={}", txId);
         }
 
         Minecraft mc = Minecraft.getInstance();
@@ -48,26 +49,26 @@ public abstract class ClientHandshakeMixin {
                         var profile = user.getGameProfile();
                         String token = user.getAccessToken();
 
-                        // 令牌只在本地使用
+                        // The access token is only used locally.
                         mc.getMinecraftSessionService().joinServer(profile, token, serverId);
                         return true;
                     } catch (Throwable t) {
-                        Trueuuid.debug(t, "joinServer 调用失败, txId={}", txId);
+                        Trueuuid.debug(t, "joinServer call failed, txId={}", txId);
                         return false;
                     }
                 })
-                // 防止 joinServer 过慢导致服务端超时并进入压缩阶段，之后再回包会引发协议/压缩错位
+                // Prevent slow joinServer from causing server timeout/compression-stage mismatch.
                 .completeOnTimeout(false, Math.max(1000L, serverTimeoutMs > 0 ? (serverTimeoutMs - 500L) : 8000L), TimeUnit.MILLISECONDS)
                 .thenAccept(ok -> {
-                    // 仅在仍处于 LOGIN 握手阶段时回包；避免“晚到的 LOGIN 包”打进 PLAY/压缩阶段导致解码异常
+                    // Reply only while still in LOGIN stage to avoid late-packet decode errors.
                     try {
                         if (this.connection.getPacketListener() != (Object) this) {
-                            Trueuuid.debug("跳过回包：已不在 LOGIN 阶段, txId={}", txId);
+                            Trueuuid.debug("Skip reply: no longer in LOGIN stage, txId={}", txId);
                             return;
                         }
                     } catch (Throwable t) {
-                        Trueuuid.debug(t, "检查 LOGIN listener 失败, txId={}", txId);
-                        // 若无法获取 listener，则仍尝试回包（保持兼容）
+                        Trueuuid.debug(t, "Failed to check LOGIN listener, txId={}", txId);
+                        // Keep compatibility: still attempt to send reply if listener check fails.
                     }
 
                     FriendlyByteBuf resp = new FriendlyByteBuf(Unpooled.buffer());
@@ -75,7 +76,7 @@ public abstract class ClientHandshakeMixin {
                     try {
                         this.connection.send(new ServerboundCustomQueryPacket(txId, resp));
                     } catch (Throwable t) {
-                        Trueuuid.debug(t, "发送认证回包失败, txId={}", txId);
+                        Trueuuid.debug(t, "Failed to send auth reply packet, txId={}", txId);
                     }
                 });
 
